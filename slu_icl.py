@@ -4,6 +4,8 @@ import logging
 import base64
 import os
 import requests
+import random
+
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -362,7 +364,7 @@ def setup_arg_parser() -> argparse.ArgumentParser:
         "--input-file", type=str, required=True, help="输入的JSONL元数据文件路径"
     )
     parser.add_argument(
-        "--audio-dir", type=str, required=True, help="存放音频文件 (.wav) 的目录路径"
+        "--audio-dir", type=str,  help="存放音频文件 (.wav) 的目录路径"
     )
     parser.add_argument(
         "--output-file", type=str, required=True, help="输出的JSONL文件路径"
@@ -401,6 +403,31 @@ def setup_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-tokens", type=int, default=512, help="模型生成的最大token数量。"
     )
+
+    # few-shot
+    parser.add_argument(
+        "--n-shot", 
+        type=int,
+        default=0,
+        help="在提示中使用的少量示例数量。"
+    )
+
+    # text dataset train_split
+    parser.add_argument(
+        "--train-input-file",
+        type=str,
+        default=None,
+        help="可选的训练集JSONL文件路径，用于few-shot示例选择。"
+    )
+
+    # audio dataset train_split
+    parser.add_argument(
+        "--train-audio-dir",
+        type=str,
+        default=None,
+        help="可选的训练集音频目录路径，用于few-shot示例选择。"
+    )
+
     return parser
 
 def encode_audio_to_base64(audio_path: Path) -> Optional[str]:
@@ -415,6 +442,38 @@ def encode_audio_to_base64(audio_path: Path) -> Optional[str]:
     except Exception as e:
         logging.error(f"编码音频文件时出错 {audio_path}: {e}", exc_info=True)
         return None
+
+
+# Raw semantics -> Standard semantics
+def transform_semantics_to_standard(raw_semantics: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    將原始訓練集的 semantics 格式轉換為系統提示詞要求的標準格式。
+    """
+    standard_list = []
+    
+    # 遍歷 意图1, 意图2...
+    for intent_key, domains in raw_semantics.items():
+        # 遍歷 領域 (如 音乐, 地图)
+        for domain_name, slots_list in domains.items():
+            new_frame = {
+                "domain": domain_name,
+                "intent": "",
+                "slots": {}
+            }
+            
+            # 提取 intent 欄位並重組 slots
+            actual_slots = {}
+            for item in slots_list:
+                if item.get("name") == "intent":
+                    new_frame["intent"] = item.get("value", "")
+                else:
+                    # 將 {"name": "歌手名", "value": "周杰倫"} 轉為 "歌手名": "周杰倫"
+                    actual_slots[item["name"]] = item["value"]
+            
+            new_frame["slots"] = actual_slots
+            standard_list.append(new_frame)
+            
+    return standard_list
 
 # --- 新增 ---: 专门用于调用本地 OpenAI 兼容接口的函数
 def call_local_api(
@@ -422,272 +481,267 @@ def call_local_api(
     model_name: str,
     audio_path: Path,
     temperature: float,
-    max_tokens: int
+    max_tokens: int,
+    text_query: str="",
+    shot_list: Optional[List[Dict[str, Any]]]=None
 ) -> Optional[str]:
     """
-    使用 openai 库向本地部署的 OpenAI 兼容服务发送 SLU 请求。
+    Use OpenAI-compatible local API to process SLU requests.
     """
+    # 1) Load OpenAI module
     if OpenAI is None:
-        raise ImportError("要使用本地提供商，请先安装openai库: pip install openai")
+        raise ImportError("OpenAI module is needed on calling local api: pip install openai")
 
     client = OpenAI(base_url=api_base, api_key="not-needed")
-    
-    audio_base64 = encode_audio_to_base64(audio_path)
-    if not audio_base64:
-        return None
 
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE},
-                {
+    messages = []
+    messages.append({
+        "role": "system",
+        "content": SYSTEM_PROMPT_TEMPLATE
+    })
+
+    # 2) Prepare few-shot examples
+    if shot_list is not None and len(shot_list) > 0:
+        for shot in shot_list:
+            """
+            shot list 結構:
+            {
+                "audio_path": Path,
+                "query": str,
+                "semantics": List[Dict[str, Any]]
+            }
+            """
+            if shot.get("audio_path") == "":
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": shot["query"]
+                        },
+                    ],
+                })
+            else:
+                shot_audio_base64 = encode_audio_to_base64(shot["audio_path"])
+                if not shot_audio_base64:
+                    continue
+                
+                messages.append({
                     "role": "user",
                     "content": [
                         {
                             "type": "audio_url",
-                            "audio_url": {"url": f"data:audio/wav;base64,{audio_base64}"}
+                            "audio_url": {"url": f"data:audio/wav;base64,{shot_audio_base64}"}
                         },
                     ],
-                }
+                })
+            standard_output = transform_semantics_to_standard(shot["semantics"])
+            messages.append({
+                "role": "assistant",
+                "content": json.dumps(standard_output, ensure_ascii=False)
+            })
+
+    # 3) Current query
+    if audio_path == "":
+        if text_query == "":
+            logging.error("Error: 本地API调用时，必须提供音频路径或文本查询。")
+            return None
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": text_query
+                },
             ],
+        })
+    else:
+        audio_base64 = encode_audio_to_base64(audio_path)
+        if not audio_base64:
+            return None
+
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": f"data:audio/wav;base64,{audio_base64}"}
+                },
+            ],
+        })
+
+    # 4) Call local API
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             stream=False
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"调用本地 API 时发生错误 (audio: {audio_path.name}): {e}", exc_info=True)
-        return None
-
-
-
-import argparse
-import json
-import logging
-import base64
-import os
-import requests
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-
-# --- 新增 ---: 导入 OpenAI 库用于本地接口调用
-try:
-    from openai import OpenAI
-except ImportError:
-    # 如果用户不使用本地模式，这个库不是必需的
-    OpenAI = None 
-
-# 使用 tqdm 显示进度条
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(iterable, **kwargs):
-        print("tqdm is not installed, progress bar will not be shown. "
-              "Install it with: pip install tqdm")
-        return iterable
-
-# --- 日志配置 ---
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
-
-def setup_arg_parser() -> argparse.ArgumentParser:
-    # ... [此函数未修改，省略] ...
-    """设置命令行参数解析器"""
-    parser = argparse.ArgumentParser(description="使用 LLM API 进行统一的语音语言理解 (SLU)")
-    parser.add_argument(
-        "--input-file", type=str, required=True, help="输入的JSONL元数据文件路径"
-    )
-    parser.add_argument(
-        "--audio-dir", type=str, required=True, help="存放音频文件 (.wav) 的目录路径"
-    )
-    parser.add_argument(
-        "--output-file", type=str, required=True, help="输出的JSONL文件路径"
-    )
-    parser.add_argument(
-        "--provider",
-        type=str,
-        default="google",
-        choices=["google", "azure", "local"],
-        help="API提供商: 'google'/'azure' (通过Dashscope), 或 'local' (本地OpenAI兼容接口)"
-    )
-    parser.add_argument(
-        "--api-base",
-        type=str,
-        default="http://0.0.0.0:12355/v1",
-        help="本地LLM服务的API基地址 (仅当 --provider='local' 时使用)"
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        default=None,
-        help="LLM服务的API key。本地服务通常不需要，云服务则必需。"
-    )
-    parser.add_argument(
-        "--model-name",
-        type=str,
-        default="gemini-2.5-flash",
-        help="要使用的模型名称 (例如: 'gemini-2.5-flash', 或本地部署的模型名)"
-    )
-    parser.add_argument(
-        "--temperature", type=float, default=0.0, help="生成文本的温度。"
-    )
-    parser.add_argument(
-        "--max-tokens", type=int, default=512, help="模型生成的最大token数量。"
-    )
-    return parser
-
-def encode_audio_to_base64(audio_path: Path) -> Optional[str]:
-    # ... [此函数未修改，省略] ...
-    """读取音频文件，进行Base64编码，并返回字符串。"""
-    try:
-        with open(audio_path, "rb") as audio_file:
-            binary_data = audio_file.read()
-            return base64.b64encode(binary_data).decode('utf-8')
-    except FileNotFoundError:
-        logging.error(f"音频文件未找到: {audio_path}")
-        return None
-    except Exception as e:
-        logging.error(f"编码音频文件时出错 {audio_path}: {e}", exc_info=True)
-        return None
-
-def call_local_api(
-    api_base: str,
-    model_name: str,
-    audio_path: Path,
-    temperature: float,
-    max_tokens: int
-) -> Optional[str]:
-    # ... [此函数未修改，省略] ...
-    """
-    使用 openai 库向本地部署的 OpenAI 兼容服务发送 SLU 请求。
-    """
-    if OpenAI is None:
-        raise ImportError("要使用本地提供商，请先安装openai库: pip install openai")
-
-    client = OpenAI(base_url=api_base, api_key="not-needed")
+        logging.error(f"调用本地 API 时发生错误 (audio: {audio_path.name if audio_path != '' else 'text query'}): {e}", exc_info=True)
+        return None   
     
-    audio_base64 = encode_audio_to_base64(audio_path)
-    if not audio_base64:
-        return None
-
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE},
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "audio_url",
-                            "audio_url": {"url": f"data:audio/wav;base64,{audio_base64}"}
-                        },
-                    ],
-                }
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=False
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logging.error(f"调用本地 API 时发生错误 (audio: {audio_path.name}): {e}", exc_info=True)
-        return None
 
 # --- 核心修复 ---
 # 对 call_cloud_api 函数进行修改，以支持 provider-specific 的请求体
-def call_cloud_api(
-    api_key: str,
-    provider: str,
-    model_name: str,
-    audio_path: Path,
-    temperature: float,
-    max_tokens: int
-) -> Optional[str]:
-    """
-    使用 requests 库向云服务（通过Dashscope）发送SLU请求。
-    此版本修复了对不同 provider（google vs azure）的请求体差异。
-    """
-    API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-    audio_base64 = encode_audio_to_base64(audio_path)
-    if not audio_base64:
-        return None
+# def call_cloud_api(
+#     api_key: str,
+#     provider: str,
+#     model_name: str,
+#     audio_path: Path,
+#     temperature: float,
+#     max_tokens: int
+# ) -> Optional[str]:
+#     """
+#     使用 requests 库向云服务（通过Dashscope）发送SLU请求。
+#     此版本修复了对不同 provider（google vs azure）的请求体差异。
+#     """
+#     API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+#     audio_base64 = encode_audio_to_base64(audio_path)
+#     if not audio_base64:
+#         return None
 
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+#     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     
-    user_content = []
-    # --- 修复点 ---: 根据 provider 构建不同的 user_content
-    if provider == "google":
-        dashscope_file_url = f"data:audio/wav;base64,{audio_base64}"
-        user_content.append({"type": "audio_url", "audio_url": {"url": dashscope_file_url}})
-    elif provider == "azure":
-        # Azure GPT-4o 音频模型需要不同的格式
-        user_content.append({"type": "input_audio", "input_audio": {"data": audio_base64, "format": "wav"}})
-    else:
-        logging.error(f"不支持的云提供商: {provider}")
-        return None
+#     user_content = []
+#     # --- 修复点 ---: 根据 provider 构建不同的 user_content
+#     if provider == "google":
+#         dashscope_file_url = f"data:audio/wav;base64,{audio_base64}"
+#         user_content.append({"type": "audio_url", "audio_url": {"url": dashscope_file_url}})
+#     elif provider == "azure":
+#         # Azure GPT-4o 音频模型需要不同的格式
+#         user_content.append({"type": "input_audio", "input_audio": {"data": audio_base64, "format": "wav"}})
+#     else:
+#         logging.error(f"不支持的云提供商: {provider}")
+#         return None
 
-    # 可以选择性地添加一个文本部分，引导模型专注于SLU任务
-    user_content.append({"type": "text", "text": "请根据系统指令处理提供的音频。"})
+#     # 可以选择性地添加一个文本部分，引导模型专注于SLU任务
+#     user_content.append({"type": "text", "text": "请根据系统指令处理提供的音频。"})
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE},
-        {"role": "user", "content": user_content}
-    ]
+#     messages = [
+#         {"role": "system", "content": SYSTEM_PROMPT_TEMPLATE},
+#         {"role": "user", "content": user_content}
+#     ]
 
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "top_p": 0.9,
-        'dashscope_extend_params': {'provider': provider}
-    }
+#     payload = {
+#         "model": model_name,
+#         "messages": messages,
+#         "temperature": temperature,
+#         "max_tokens": max_tokens,
+#         "top_p": 0.9,
+#         'dashscope_extend_params': {'provider': provider}
+#     }
 
-    try:
-        response = requests.post(API_URL, headers=headers, json=payload)
-        response.raise_for_status()
-        response_json = response.json()
+#     try:
+#         response = requests.post(API_URL, headers=headers, json=payload)
+#         response.raise_for_status()
+#         response_json = response.json()
         
-        # --- 调试点：检查响应中是否有错误字段 ---
-        if 'error' in response_json:
-            logging.error(f"API返回了错误信息: {response_json['error']}")
-            return None # 如果有错误，直接返回None
+#         # --- 调试点：检查响应中是否有错误字段 ---
+#         if 'error' in response_json:
+#             logging.error(f"API返回了错误信息: {response_json['error']}")
+#             return None # 如果有错误，直接返回None
 
-        return response_json['choices'][0]['message']['content'].strip()
+#         return response_json['choices'][0]['message']['content'].strip()
 
-    except requests.exceptions.RequestException as e:
-        logging.error(f"调用云 API 时发生网络错误 (audio: {audio_path.name}): {e}")
-        # --- 调试点：打印出详细的响应体 ---
-        if e.response is not None:
-            logging.error(f"API 响应状态码: {e.response.status_code}")
-            logging.error(f"API 响应内容: {e.response.text}") # 这一行最关键
-        return None
-    except (KeyError, IndexError) as e:
-        logging.error(f"解析云 API 响应时出错: {e}. Response: {response.text}")
-        return None
+#     except requests.exceptions.RequestException as e:
+#         logging.error(f"调用云 API 时发生网络错误 (audio: {audio_path.name}): {e}")
+#         # --- 调试点：打印出详细的响应体 ---
+#         if e.response is not None:
+#             logging.error(f"API 响应状态码: {e.response.status_code}")
+#             logging.error(f"API 响应内容: {e.response.text}") # 这一行最关键
+#         return None
+#     except (KeyError, IndexError) as e:
+#         logging.error(f"解析云 API 响应时出错: {e}. Response: {response.text}")
+#         return None
+
+
 def process_file(args: argparse.Namespace):
-    """
-    读取元数据文件，加载对应音频，根据provider选择API处理，并将结果写入输出文件。
-    """
-    input_file, audio_dir, output_file = Path(args.input_file), Path(args.audio_dir), Path(args.output_file)
+    # 1) Preparing file paths
+    input_file = Path(args.input_file)
+    if args.audio_dir is None:
+        audio_dir = ""
+    else:
+        audio_dir = Path(args.audio_dir)
+    output_file = Path(args.output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     try:
         with open(input_file, 'r', encoding='utf-8') as f:
             lines = f.readlines()
     except FileNotFoundError:
-        logging.error(f"错误: 输入文件未找到 {input_file}")
+        logging.error(f"Error: Cannot find test input file {input_file}")
         return
 
+    # 2) Few-shot：Build shot-list
+    shot_list = []
+    if(args.n_shot > 0):
+        """
+        shot list 結構:
+        {
+            "audio_path": Path,
+            "query": str,
+            "semantics": List[Dict[str, Any]]
+        }
+        """
+        logging.info(f"使用 {args.n_shot}-shot，正在建構 shot list...")
+
+        ## Checking train text file
+        if(args.train_input_file is None):
+            logging.error("Error: 使用 few-shot 时，必须提供 --train-file 参数。")
+            return
+        train_input_file = Path(args.train_input_file)
+
+        ## Load train text lines
+        try:
+            with open(train_input_file, 'r', encoding='utf-8') as f:
+                train_lines = f.readlines()
+        except FileNotFoundError:
+            logging.error(f"Error: Cannot find train input file {train_input_file}")
+            return
+
+        ## randomly select n-shot examples
+        if(len(train_lines) < args.n_shot):
+            logging.error(f"Error: The number of train dataset ({len(train_lines)}) is less than number of shots ({args.n_shot})。")
+            return
+
+        shot_indices = random.sample(range(len(train_lines)), args.n_shot)
+
+        ## Checking audio dir for train set
+        if args.train_audio_dir is None:
+            train_audio_dir = ""
+        else:
+            train_audio_dir = Path(args.train_audio_dir)
+
+        ## Build shot list
+        for idx in shot_indices:
+            shot_data = json.loads(train_lines[idx])
+            item_id = shot_data.get("id")
+            query = shot_data.get("query")
+            semantics = shot_data.get("semantics", [])
+
+            if (train_audio_dir != ""):
+                audio_path = train_audio_dir / f"id_{item_id}.wav"
+                if not audio_path.exists():
+                    logging.warning(f"跳过 few-shot 示例，找不到音频文件: {audio_path}")
+                    continue
+            else:
+                audio_path = ""
+
+            shot_list.append({
+                "audio_path": audio_path,
+                "query": query,
+                "semantics": semantics
+            })
+        
+    # 3) Processing each line
     logging.info(f"开始处理文件 {input_file}，共 {len(lines)} 条记录... 使用 provider: {args.provider}")
     
     with open(output_file, 'w', encoding='utf-8') as outfile:
-        for line in tqdm(lines, desc="处理音频中"):
+        for line in tqdm(lines, desc="處理資料中"):
             try:
                 data = json.loads(line)
                 item_id = data.get("id")
@@ -696,10 +750,13 @@ def process_file(args: argparse.Namespace):
                     logging.warning(f"跳过格式错误的行（缺少id）: {line.strip()}")
                     continue
                 
-                audio_path = audio_dir / f"id_{item_id}.wav"
-                if not audio_path.exists():
-                    logging.warning(f"跳过记录，找不到音频文件: {audio_path}")
-                    continue
+                if (audio_dir != ""):
+                    audio_path = audio_dir / f"id_{item_id}.wav"
+                    if not audio_path.exists():
+                        logging.warning(f"跳过记录，找不到音频文件: {audio_path}")
+                        continue
+                else:
+                    audio_path = ""
 
                 model_output_str = None
                 # --- 修改 ---: 根据 provider 选择不同的 API 调用函数
@@ -707,19 +764,21 @@ def process_file(args: argparse.Namespace):
                     model_output_str = call_local_api(
                         api_base=args.api_base,
                         model_name=args.model_name,
+                        text_query=ground_truth_query,
                         audio_path=audio_path,
                         temperature=args.temperature,
-                        max_tokens=args.max_tokens
+                        max_tokens=args.max_tokens,
+                        shot_list=shot_list
                     )
-                else: # google or azure
-                    model_output_str = call_cloud_api(
-                        api_key=args.api_key,
-                        provider=args.provider,
-                        model_name=args.model_name,
-                        audio_path=audio_path,
-                        temperature=args.temperature,
-                        max_tokens=args.max_tokens
-                    )
+                # else: # google or azure
+                #     model_output_str = call_cloud_api(
+                #         api_key=args.api_key,
+                #         provider=args.provider,
+                #         model_name=args.model_name,
+                #         audio_path=audio_path,
+                #         temperature=args.temperature,
+                #         max_tokens=args.max_tokens
+                #     )
 
                 # 解析逻辑保持不变
                 parsed_semantics_list: List[Dict[str, Any]] = []
@@ -770,3 +829,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# /share/nas169/andyfang/mac_slu/audio/audio_test
+# /share/nas169/andyfang/mac_slu/label/test_set.jsonl

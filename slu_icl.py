@@ -346,6 +346,7 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 5.  **空结果**: 如果用户的查询没有匹配到任何领域和意图，请返回一个空的列表: `[]`
 6.  **不要包含任何解释**: 你的最终回答中，除了要求的JSON列表，不要包含任何其他文字、解释或注释。
 7.  **必要知识**: 对于“车载控制”领域，“车机控制”针对屏幕等虚拟对象（如“连接蓝牙”）；“车身控制”针对车窗、空调等物理实体（如“空调温度调低一点”）；“提供信息”用于无实体的情况。
+8. **你的回答必須直接以 [ 字元開始，絕對不能有任何開場白或推理過程。**
 
 ---
 **可选的领域和意图列表：**
@@ -428,6 +429,13 @@ def setup_arg_parser() -> argparse.ArgumentParser:
         help="可选的训练集音频目录路径，用于few-shot示例选择。"
     )
 
+    parser.add_argument(
+        "--stage",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="多階段提示詞：預設為 1 (單階段提示詞)，可選 2 (雙階段提示詞)"
+    )
     return parser
 
 def encode_audio_to_base64(audio_path: Path) -> Optional[str]:
@@ -443,6 +451,27 @@ def encode_audio_to_base64(audio_path: Path) -> Optional[str]:
         logging.error(f"编码音频文件时出错 {audio_path}: {e}", exc_info=True)
         return None
 
+
+def extract_json_string(text: Any) -> str:
+    import re
+    if not isinstance(text, str):
+        return "[]"
+
+    # 1. 移除 <think> 標籤及其內容
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    
+    # 2. 移除 Markdown 程式碼塊語法 (```json ... ```)
+    text = re.sub(r'```(?:json)?\s*|```', '', text).strip()
+    
+    # 3. 尋找 JSON 列表的邊界 [ ... ]
+    start = text.find('[')
+    end = text.rfind(']')
+    
+    if start != -1 and end != -1:
+        return text[start:end+1]
+    
+    # 4. 如果沒找到 [ ]，但內容看起來像空結果，回傳標準空列表字串
+    return "[]"
 
 # Raw semantics -> Standard semantics
 def transform_semantics_to_standard(raw_semantics: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -483,7 +512,8 @@ def call_local_api(
     temperature: float,
     max_tokens: int,
     text_query: str="",
-    shot_list: Optional[List[Dict[str, Any]]]=None
+    shot_list: Optional[List[Dict[str, Any]]]=None,
+    previous_res: str="",
 ) -> Optional[str]:
     """
     Use OpenAI-compatible local API to process SLU requests.
@@ -492,13 +522,25 @@ def call_local_api(
     if OpenAI is None:
         raise ImportError("OpenAI module is needed on calling local api: pip install openai")
 
-    client = OpenAI(base_url=api_base, api_key="not-needed")
+    client = OpenAI(base_url=api_base, api_key="ollama")
 
     messages = []
-    messages.append({
-        "role": "system",
-        "content": SYSTEM_PROMPT_TEMPLATE
-    })
+    if previous_res != "":
+        messages.append({
+            "role": "system",
+            "content": SYSTEM_PROMPT_TEMPLATE
+        })
+    else:
+        STAGE2_SYSTEM_PROMPT_TEMPLATE = f"""
+            {SYSTEM_PROMPT_TEMPLATE}
+            ---
+            這是可能的答案：
+            {previous_res}
+        """
+        messages.append({
+            "role": "system",
+            "content": STAGE2_SYSTEM_PROMPT_TEMPLATE 
+        })
 
     # 2) Prepare few-shot examples
     if shot_list is not None and len(shot_list) > 0:
@@ -579,7 +621,8 @@ def call_local_api(
             max_tokens=max_tokens,
             stream=False
         )
-        return response.choices[0].message.content.strip()
+        text = response.choices[0].message.content.strip()
+        return extract_json_string(text)
     except Exception as e:
         logging.error(f"调用本地 API 时发生错误 (audio: {audio_path.name if audio_path != '' else 'text query'}): {e}", exc_info=True)
         return None   
@@ -738,28 +781,29 @@ def process_file(args: argparse.Namespace):
             })
         
     # 3) Processing each line
-    logging.info(f"开始处理文件 {input_file}，共 {len(lines)} 条记录... 使用 provider: {args.provider}")
+    logging.info(f"Starting to process {len(lines)} lines from {input_file}...")
     
     with open(output_file, 'w', encoding='utf-8') as outfile:
-        for line in tqdm(lines, desc="處理資料中"):
+        for line in tqdm(lines, desc="Processing dataset"):
             try:
                 data = json.loads(line)
                 item_id = data.get("id")
                 ground_truth_query = data.get("query")
                 if not item_id:
-                    logging.warning(f"跳过格式错误的行（缺少id）: {line.strip()}")
+                    logging.warning(f"Miss line id: {line.strip()}")
                     continue
                 
                 if (audio_dir != ""):
                     audio_path = audio_dir / f"id_{item_id}.wav"
                     if not audio_path.exists():
-                        logging.warning(f"跳过记录，找不到音频文件: {audio_path}")
+                        logging.warning(f"Cannot find the audio: {audio_path}")
                         continue
                 else:
                     audio_path = ""
 
                 model_output_str = None
-                # --- 修改 ---: 根据 provider 选择不同的 API 调用函数
+
+                ## ======== Stage 1 ========
                 if args.provider == "local":
                     model_output_str = call_local_api(
                         api_base=args.api_base,
@@ -770,15 +814,19 @@ def process_file(args: argparse.Namespace):
                         max_tokens=args.max_tokens,
                         shot_list=shot_list
                     )
-                # else: # google or azure
-                #     model_output_str = call_cloud_api(
-                #         api_key=args.api_key,
-                #         provider=args.provider,
-                #         model_name=args.model_name,
-                #         audio_path=audio_path,
-                #         temperature=args.temperature,
-                #         max_tokens=args.max_tokens
-                #     )
+                
+                ## ======== Stage 2 ========
+                if args.stage == 2 and model_output_str is not None:
+                    model_output_str = call_local_api(
+                        api_base=args.api_base,
+                        model_name=args.model_name,
+                        text_query=ground_truth_query,
+                        audio_path=audio_path,
+                        temperature=args.temperature,
+                        max_tokens=args.max_tokens,
+                        shot_list=shot_list,
+                        previous_res=model_output_str
+                    )
 
                 # 解析逻辑保持不变
                 parsed_semantics_list: List[Dict[str, Any]] = []

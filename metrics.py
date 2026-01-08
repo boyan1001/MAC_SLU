@@ -76,131 +76,110 @@ def normalize_semantics(semantics_list):
 
 def calculate_metrics(predict_file, ground_truth_file):
     """
-    Reads prediction and ground truth files line by line to calculate multiple evaluation metrics.
-    Data is normalized before comparison.
-
-    Args:
-        predict_file (str): Path to the prediction JSONL file.
-        ground_truth_file (str): Path to the ground truth JSONL file.
-
-    Returns:
-        dict: A dictionary containing the evaluation results.
+    修改版本：支援 ID 匹配，自動跳過缺失或不對齊的數據。
     """
+    # 1. 讀取 Ground Truth 並建立索引
+    gt_map = {}
     try:
-        with open(predict_file, 'r', encoding='utf-8') as f_pred:
-            predict_lines = f_pred.readlines()
-        with open(ground_truth_file, 'r', encoding='utf-8') as f_gt:
-            ground_truth_lines = f_gt.readlines()
+        # 使用 errors='replace' 防止非法位元組導致崩潰
+        with open(ground_truth_file, 'r', encoding='utf-8', errors='replace') as f_gt:
+            for line_idx, line in enumerate(f_gt, 1):
+                try:
+                    data = json.loads(line.strip())
+                    sample_id = str(data.get("id", ""))
+                    if not sample_id:
+                        print(f"Warning: Ground truth line {line_idx} missing 'id', skipped.", file=sys.stderr)
+                        continue
+                    gt_map[sample_id] = data
+                except json.JSONDecodeError:
+                    continue
     except FileNotFoundError as e:
-        print(f"Error: File not found - {e}", file=sys.stderr)
+        print(f"Error: Ground truth file not found - {e}", file=sys.stderr)
         sys.exit(1)
 
-    if len(predict_lines) != len(ground_truth_lines):
-        print(
-            f"Error: File line counts do not match.\n"
-            f"  - Prediction File ({predict_file}): {len(predict_lines)} lines\n"
-            f"  - Ground Truth File ({ground_truth_file}): {len(ground_truth_lines)} lines",
-            file=sys.stderr
-        )
-        sys.exit(1)
-
-    total_count = len(predict_lines)
-    if total_count == 0:
-        print("Warning: File is empty, cannot calculate metrics.", file=sys.stderr)
-        return {
-            "total_count": 0, "overall_match_count": 0, "overall_accuracy": 1.0,
-            "intent_match_count": 0, "intent_accuracy": 1.0,
-            "slot_tp": 0, "slot_fp": 0, "slot_fn": 0,
-            "slot_precision": 1.0, "slot_recall": 1.0, "slot_f1": 1.0,
-        }
-
-    # Initialize counters
+    # 2. 迭代處理 Prediction 檔案
     overall_match_count = 0
     intent_match_count = 0
     slot_tp, slot_fp, slot_fn = 0, 0, 0 
+    processed_count = 0
 
-    for i, (pred_line, gt_line) in enumerate(zip(predict_lines, ground_truth_lines)):
-        try:
-            pred_data = json.loads(pred_line.strip())
-            gt_data = json.loads(gt_line.strip())
+    try:
+        with open(predict_file, 'r', encoding='utf-8', errors='replace') as f_pred:
+            for line_idx, pred_line in enumerate(f_pred, 1):
+                try:
+                    pred_data = json.loads(pred_line.strip())
+                    sample_id = str(pred_data.get("id", ""))
+                    
+                    # 檢查 ID 是否存在於 Ground Truth 中
+                    if sample_id not in gt_map:
+                        # 這裡直接跳過，不中斷程式
+                        continue
+                    
+                    gt_data = gt_map[sample_id]
+                    processed_count += 1
 
-            # Get raw semantics
-            raw_pred_semantics = pred_data.get("semantics", [])
-            raw_gt_semantics = gt_data.get("semantics", [])
+                    # --- 核心邏輯保持不變 ---
+                    pred_semantics = normalize_semantics(pred_data.get("semantics", []))
+                    gt_semantics = normalize_semantics(gt_data.get("semantics", []))
+                    
+                    # 1. Overall Accuracy
+                    if pred_semantics == gt_semantics:
+                        overall_match_count += 1
+                    
+                    # 2. Intent Accuracy
+                    pred_intents = sorted([(s.get("domain"), s.get("intent")) for s in pred_semantics])
+                    gt_intents = sorted([(s.get("domain"), s.get("intent")) for s in gt_semantics])
+                    if pred_intents == gt_intents:
+                        intent_match_count += 1
 
-            # --- [New Step] Data Normalization ---
-            pred_semantics = normalize_semantics(raw_pred_semantics)
-            gt_semantics = normalize_semantics(raw_gt_semantics)
-            
-            # --- 1. Calculate Overall Accuracy (Exact Match) ---
-            # Requires the entire structure (after normalization) to be identical.
-            # Note: Different list orders will result in a mismatch.
-            if pred_semantics == gt_semantics:
-                overall_match_count += 1
-            
-            # --- 2. Calculate Intent Accuracy (All Intents Correct) ---
-            # Extract all (domain, intent) pairs in the sample.
-            # Use sorted() to ignore the list order.
-            pred_intents = sorted([(s.get("domain"), s.get("intent")) for s in pred_semantics])
-            gt_intents = sorted([(s.get("domain"), s.get("intent")) for s in gt_semantics])
+                    # 3. Slot Metrics
+                    pred_slot_set = set()
+                    for s in pred_semantics:
+                        slots = s.get("slots", {})
+                        if isinstance(slots, dict):
+                            for k, v in slots.items():
+                                pred_slot_set.add((k, v))
+                    
+                    gt_slot_set = set()
+                    for s in gt_semantics:
+                        slots = s.get("slots", {})
+                        if isinstance(slots, dict):
+                            for k, v in slots.items():
+                                gt_slot_set.add((k, v))
 
-            if pred_intents == gt_intents:
-                intent_match_count += 1
+                    slot_tp += len(pred_slot_set.intersection(gt_slot_set))
+                    slot_fp += len(pred_slot_set.difference(gt_slot_set))
+                    slot_fn += len(gt_slot_set.difference(pred_slot_set))
 
-            # --- 3. Calculate Slot Filling Metrics (Global Aggregation) ---
-            pred_slot_set = set()
-            for s in pred_semantics:
-                slots = s.get("slots", {})
-                if isinstance(slots, dict):
-                    for k, v in slots.items():
-                        pred_slot_set.add((k, v))
-            
-            gt_slot_set = set()
-            for s in gt_semantics:
-                slots = s.get("slots", {})
-                if isinstance(slots, dict):
-                    for k, v in slots.items():
-                        gt_slot_set.add((k, v))
+                except json.JSONDecodeError:
+                    print(f"Warning: JSON parse error at prediction line {line_idx}, skipped.", file=sys.stderr)
+                except Exception as e:
+                    print(f"Warning: Unexpected error at line {line_idx}: {e}", file=sys.stderr)
 
-            # Calculate TP, FP, FN
-            slot_tp += len(pred_slot_set.intersection(gt_slot_set))
-            slot_fp += len(pred_slot_set.difference(gt_slot_set))
-            slot_fn += len(gt_slot_set.difference(pred_slot_set))
+    except FileNotFoundError as e:
+        print(f"Error: Prediction file not found - {e}", file=sys.stderr)
+        sys.exit(1)
 
-        except json.JSONDecodeError:
-            print(f"Warning: JSON parse error at line {i+1}, skipped.", file=sys.stderr)
-        except Exception as e:
-            print(f"Warning: Unknown error at line {i+1}: {e}, skipped.", file=sys.stderr)
+    # 檢查是否有成功匹配的數據
+    if processed_count == 0:
+        print("Error: No matching Sample IDs found between files.", file=sys.stderr)
+        return {k: 0.0 for k in ["overall_accuracy", "intent_accuracy", "slot_f1"]} # 簡化返回
 
-    # --- Calculate Final Metrics ---
-    overall_accuracy = overall_match_count / total_count if total_count > 0 else 0.0
-    intent_accuracy = intent_match_count / total_count if total_count > 0 else 0.0
+    # --- 計算最終指標 (除數改為 processed_count) ---
+    overall_accuracy = overall_match_count / processed_count
+    intent_accuracy = intent_match_count / processed_count
 
-    # Calculate Slot F1
-    if slot_tp + slot_fp == 0:
-        slot_precision = 1.0 if slot_fn == 0 else 0.0
-    else:
-        slot_precision = slot_tp / (slot_tp + slot_fp)
-
-    if slot_tp + slot_fn == 0:
-        slot_recall = 1.0 if slot_fp == 0 else 0.0
-    else:
-        slot_recall = slot_tp / (slot_tp + slot_fn)
-
-    if slot_precision + slot_recall == 0:
-        slot_f1 = 0.0
-    else:
-        slot_f1 = 2 * (slot_precision * slot_recall) / (slot_precision + slot_recall)
+    slot_precision = slot_tp / (slot_tp + slot_fp) if (slot_tp + slot_fp) > 0 else 0.0
+    slot_recall = slot_tp / (slot_tp + slot_fn) if (slot_tp + slot_fn) > 0 else 0.0
+    slot_f1 = 2 * (slot_precision * slot_recall) / (slot_precision + slot_recall) if (slot_precision + slot_recall) > 0 else 0.0
 
     return {
-        "total_count": total_count,
+        "total_count": processed_count, # 這是實際有對齊到的樣本數
         "overall_match_count": overall_match_count,
         "overall_accuracy": overall_accuracy,
         "intent_match_count": intent_match_count,
         "intent_accuracy": intent_accuracy,
-        "slot_tp": slot_tp,
-        "slot_fp": slot_fp,
-        "slot_fn": slot_fn,
+        "slot_tp": slot_tp, "slot_fp": slot_fp, "slot_fn": slot_fn,
         "slot_precision": slot_precision,
         "slot_recall": slot_recall,
         "slot_f1": slot_f1,

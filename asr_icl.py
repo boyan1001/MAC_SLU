@@ -33,8 +33,7 @@ def call_local_api(
     api_base: str,
     model_name: str,
     audio_path: Path,
-    temperature: float,
-    max_tokens: int,
+    temperature: float
 ) -> Optional[str]:
     """
     Use OpenAI-compatible local API to transcribe audio file.
@@ -47,20 +46,24 @@ def call_local_api(
     client = OpenAI(base_url=api_base, api_key="no-need")
 
     # 2) Get audio data
-    with open(audio_path, "rb") as audio_file:
-        audio_data = audio_file.read()
+    try:
+        with open(audio_path, "rb") as audio_file:
+            audio_data = audio_file.read()
+    except Exception as e:
+        logging.error(f"Error reading audio file {audio_path}: {e}")
+        return None
 
     # 3) Call local API
     try:
-        response = client.audio.transcriptions.create(
+        resp = client.audio.transcriptions.create(
             model=model_name,
-            file=audio_data,
+            file=(audio_path.name, audio_data),
             response_format="json",
             temperature=temperature,
-            max_tokens=max_tokens,
             language="zh",
         )
-        return response.get("text", "")
+
+        return resp.text.strip()
     except Exception as e:
         logging.error(f"Error calling local API for {audio_path}: {e}")
         return None
@@ -107,9 +110,6 @@ def setup_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--temperature", type=float, default=0.0, help="生成文本的温度。"
     )
-    parser.add_argument(
-        "--max-tokens", type=int, default=512, help="模型生成的最大token数量。"
-    )
 
     return parser
 
@@ -145,7 +145,6 @@ def process_file(args: argparse.Namespace):
                     model_name=args.model_name,
                     audio_path=audio_path,
                     temperature=args.temperature,
-                    max_tokens=args.max_tokens,
                 )
 
                 if text is None:
